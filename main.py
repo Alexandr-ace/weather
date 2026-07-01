@@ -1,12 +1,10 @@
-import requests
+import time
 import telebot
 import os
 from dotenv import load_dotenv
 import asyncio
 import aiohttp
-from aiogram import Router
-from aiogram.filters import Command
-from aiogram.types import Message
+
 
 load_dotenv()
 
@@ -19,7 +17,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 # Словарь для хранения выбранных городов пользователей
 user_keywords_cities = {}
-router = Router()
+
 
 # Ключи в нижнем регистре!
 CITIES = {
@@ -45,12 +43,55 @@ def send_welcome(message):
     bot.send_message(message.chat.id, welcome_text)
 
 
+async def fetch_weather_for_city(session, city, lat, lon):
+    """Получает погоду для ОДНОГО города."""
+    # 1. Формируем URL
+    full_url = f"{weather_api_url}?latitude={lat}&longitude={lon}&current_weather=true"
+    # 2. Делаем запрос через session.get()
+    try:
+        async with session.get(full_url) as response:
+            # 3. Проверяем статус (в aiohttp это status, не status_code!)
+            if response.status != 200:
+                print(f"❌ Ошибка для {city}: статус {response.status}")
+                return None
+            # 4. Парсим JSON (обязательно с await!)
+            data = await response.json()
+            # 5. Извлекаем нужные данные
+            current_weather = data["current_weather"]
+            # 6. Возвращаем структурированный результат
+            return {
+                "city": city,
+                "temp": current_weather["temperature"],
+                "wind": current_weather["windspeed"],
+                "code": current_weather["weathercode"]
+            }
+    except Exception as e:
+        # 7. Если что-то пошло не так — возвращаем None (не падаем!)
+        print(f"❌ Исключение для {city}: {e}")
+        return None
+
+async def fetch_all_weathers(cities_list):
+    """Получает погоду для ВСЕХ городов ПАРАЛЛЕЛЬНО."""
+    # 1. Создаём ОДНУ aiohttp.ClientSession()
+    async with aiohttp.ClientSession() as session:
+        # 2. Создаём список задач: [fetch_weather_for_city(...) для каждого города]
+        tasks = []
+        for city in cities_list:
+            lat, lon = CITIES[city]
+            task = fetch_weather_for_city(session, city, lat, lon)
+            tasks.append(task)
+        # 3. Запускаем все через asyncio.gather(*tasks)
+        # 4. Возвращаем список результатов
+        results = await asyncio.gather(*tasks)
+        return results
+    
+
 @bot.message_handler(commands=['weather'])
 def send_weather(message):
-    # 1. Получаем города пользователя (с защитой от KeyError)
+    start_time = time.time()  # ← замер времени
+    
     user_cities = user_keywords_cities.get(message.chat.id, [])
     
-    # 2. Проверяем, что есть выбранные города
     if not user_cities:
         bot.send_message(
             message.chat.id,
@@ -58,48 +99,34 @@ def send_weather(message):
         )
         return
     
-    # 3. Проходим по всем выбранным городам
-    for city in user_cities:
-        lat, lon = CITIES[city]
-        
-        # 4. Формируем URL
-        full_url = f"{weather_api_url}?latitude={lat}&longitude={lon}&current_weather=true"
-        
-        # 5. Делаем запрос
-        response = requests.get(full_url)
-        
-        # 6. Проверяем статус
-        if response.status_code != 200:
-            bot.send_message(
-                message.chat.id,
-                f"❌ Не удалось получить погоду для {city.title()}"
-            )
-            continue  # переходим к следующему городу
-        
-        # 7. Парсим JSON
-        try:
-            data = response.json()
-            current_weather = data["current_weather"]
-            temp = current_weather["temperature"]
-            wind = current_weather["windspeed"]
-            code = current_weather["weathercode"]
-            
-            # 8. Формируем сообщение (с правильным названием города!)
+    # Запускаем асинхронную функцию
+    results = asyncio.run(fetch_all_weathers(user_cities))
+    
+    # Обрабатываем результаты
+    for i, result in enumerate(results):
+        if result:
+            # Успех — формируем красивое сообщение
             weather_text = (
-                f"🌍 Погода в {city.title()}:\n"
-                f"🌡️ Температура: {temp}°C\n"
-                f"💨 Ветер: {wind} м/с\n"
-                f"☁️ Код погоды: {code}"
+                f"🌍 Погода в {result['city'].title()}:\n"
+                f"🌡️ Температура: {result['temp']}°C\n"
+                f"💨 Ветер: {result['wind']} м/с\n"
+                f"☁️ Код погоды: {result['code']}"
             )
             bot.send_message(message.chat.id, weather_text)
-        
-        except Exception as e:
-            print(f"Ошибка парсинга: {e}")
+        else:
+            # Ошибка — берём город по индексу
+            city_name = user_cities[i].title()
             bot.send_message(
                 message.chat.id,
-                f"❌ Ошибка обработки данных для {city.title()}"
+                f"❌ Не удалось получить погоду для {city_name}"
             )
-
+    
+    # Показываем общее время
+    total_time = time.time() - start_time
+    bot.send_message(
+        message.chat.id,
+        f"⏱️ Время выполнения: {round(total_time, 2)}с"
+    )
 
 @bot.message_handler(commands=['cities'])
 def choose_weather(message):
